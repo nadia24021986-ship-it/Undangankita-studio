@@ -335,7 +335,13 @@ export default function App() {
   };
 
   const copyLink = () => {
-    const url = `https://undangkita.studio/${data.slug || "nama-anda"}`;
+    // Gunakan domain tempat aplikasi ini benar-benar di-hosting (mis. xxx.vercel.app),
+    // bukan domain contoh/placeholder, supaya link yang disalin selalu valid.
+    const origin =
+      typeof window !== "undefined" && window.location?.origin
+        ? window.location.origin
+        : "";
+    const url = `${origin}/${data.slug || "nama-anda"}`;
     if (navigator.clipboard) {
       navigator.clipboard.writeText(url).catch(() => {});
     }
@@ -453,7 +459,7 @@ export default function App() {
                   <FieldLabel icon={LinkIcon}>Slug URL Undangan</FieldLabel>
                   <div className="flex items-center bg-slate-900/80 border border-slate-700/80 rounded-lg overflow-hidden focus-within:border-fuchsia-500/60 focus-within:ring-1 focus-within:ring-fuchsia-500/40">
                     <span className="pl-3 text-xs text-slate-500 whitespace-nowrap">
-                      undangkita.studio/
+                      situs-anda.com/
                     </span>
                     <input
                       value={data.slug}
