@@ -24,6 +24,14 @@ import {
   ArrowLeft,
   Link as LinkIcon,
   X,
+  Lock,
+  Loader2,
+  CheckCircle2,
+  AlertCircle,
+  MessageCircle,
+  RefreshCw,
+  Users,
+  Share2,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -244,19 +252,152 @@ function UploadBox({ label, previewUrl, onFile, roundedFull }) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  APP UTAMA                                                          */
+/*  KONEKSI SERVER (SUPABASE) — untuk menyimpan & mengambil data       */
+/*  undangan secara online, supaya bisa dibuka dari HP mana pun.       */
 /* ------------------------------------------------------------------ */
 
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || "";
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
+const isSupabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+
+async function fetchInvitation(slug) {
+  if (!isSupabaseConfigured || !slug) return { data: null, error: "not-configured" };
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/invitations?slug=eq.${encodeURIComponent(slug)}&select=data`,
+      {
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        },
+      }
+    );
+    if (!res.ok) return { data: null, error: "fetch-failed" };
+    const json = await res.json();
+    if (!json || json.length === 0) return { data: null, error: "not-found" };
+    return { data: json[0].data, error: null };
+  } catch {
+    return { data: null, error: "network" };
+  }
+}
+
+async function saveInvitation(slug, data) {
+  if (!isSupabaseConfigured || !slug) return { ok: false };
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/invitations`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        Prefer: "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify([{ slug, data, updated_at: new Date().toISOString() }]),
+    });
+    return { ok: res.ok };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  ROUTING SEDERHANA BERBASIS PATH (tanpa library routing)            */
+/*  "/"                  -> mode ADMIN  (dashboard editor, dikunci)    */
+/*  "/tuan-rumah/<slug>" -> mode HOST   (generator link tamu)          */
+/*  "/<slug>?to=<nama>"  -> mode GUEST  (tampilan undangan untuk tamu) */
+/* ------------------------------------------------------------------ */
+
+function parseRoute() {
+  if (typeof window === "undefined") return { mode: "admin" };
+  let path = window.location.pathname.replace(/\/+$/, "");
+  if (path === "") path = "/";
+  if (path === "/") return { mode: "admin" };
+  if (path === "/tuan-rumah") return { mode: "host", slug: "" };
+  if (path.startsWith("/tuan-rumah/")) {
+    const slug = decodeURIComponent(path.slice("/tuan-rumah/".length));
+    return { mode: "host", slug };
+  }
+  const slug = decodeURIComponent(path.slice(1).split("/")[0]);
+  const params = new URLSearchParams(window.location.search);
+  const guestName = params.get("to") || "";
+  return { mode: "guest", slug, guestName };
+}
+
+/* ------------------------------------------------------------------ */
+/*  APP UTAMA (ROUTER)                                                 */
+/* ------------------------------------------------------------------ */
+
+const ADMIN_UNLOCK_KEY = "undangkita_admin_unlocked";
+// Ganti password default ini lewat Environment Variable VITE_ADMIN_PASSWORD di Vercel.
+const ADMIN_PASSWORD = (import.meta.env.VITE_ADMIN_PASSWORD || "admin123").toString();
+
+const DRAFT_STORAGE_KEY = "undangkita_studio_draft";
+
+// Muat draf terakhir dari localStorage (hanya dipakai di sisi Admin),
+// supaya kalau app ditutup tanpa sempat tersimpan ke server, isian tidak hilang.
+function loadInitialData() {
+  if (typeof window === "undefined") return DEFAULT_DATA;
+  try {
+    const saved = window.localStorage.getItem(DRAFT_STORAGE_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      return { ...DEFAULT_DATA, ...parsed };
+    }
+  } catch {
+    // abaikan, pakai default
+  }
+  return DEFAULT_DATA;
+}
+
 export default function App() {
+  const [route] = useState(parseRoute);
+
+  if (route.mode === "host") {
+    return <HostLinkPage slug={route.slug} />;
+  }
+  if (route.mode === "guest") {
+    return <GuestPage slug={route.slug} guestNameOverride={route.guestName} />;
+  }
+  return <AdminDashboard />;
+}
+
+function AdminDashboard() {
   const [activeTab, setActiveTab] = useState("general");
   const [viewMode, setViewMode] = useState("hp"); // 'hp' | 'pc'
   const [invitationState, setInvitationState] = useState("cover"); // 'cover' | 'content'
-  const [data, setData] = useState(DEFAULT_DATA);
+  const [data, setData] = useState(loadInitialData);
   const [musicPlaying, setMusicPlaying] = useState(false);
   const [galleryIndex, setGalleryIndex] = useState(0);
   const [copied, setCopied] = useState(false);
+  const [unlocked, setUnlocked] = useState(
+    () => typeof window !== "undefined" && window.localStorage.getItem(ADMIN_UNLOCK_KEY) === "true"
+  );
+  const [passwordInput, setPasswordInput] = useState("");
+  const [passwordError, setPasswordError] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("idle"); // idle | saving | saved | error
 
   const audioRef = useRef(null);
+
+  /* ---- Simpan draf otomatis ke localStorage setiap ada perubahan data ---- */
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(data));
+    } catch {
+      // abaikan kalau storage penuh / tidak tersedia
+    }
+  }, [data]);
+
+  /* ---- Autosave ke server (debounced) setiap ada perubahan, kalau sudah login ---- */
+  useEffect(() => {
+    if (!unlocked || !data.slug) return;
+    setSaveStatus("saving");
+    const timer = setTimeout(async () => {
+      const result = await saveInvitation(data.slug, data);
+      setSaveStatus(result.ok ? "saved" : "error");
+    }, 900);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, unlocked]);
 
   const theme = THEMES[data.theme];
   const font = FONTS[data.font];
@@ -335,18 +476,28 @@ export default function App() {
   };
 
   const copyLink = () => {
-    // Gunakan domain tempat aplikasi ini benar-benar di-hosting (mis. xxx.vercel.app),
-    // bukan domain contoh/placeholder, supaya link yang disalin selalu valid.
     const origin =
       typeof window !== "undefined" && window.location?.origin
         ? window.location.origin
         : "";
-    const url = `${origin}/${data.slug || "nama-anda"}`;
+    const slug = data.slug || "nama-anda";
+    const url = `${origin}/tuan-rumah/${slug}`;
     if (navigator.clipboard) {
       navigator.clipboard.writeText(url).catch(() => {});
     }
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handlePasswordSubmit = (e) => {
+    e.preventDefault();
+    if (passwordInput === ADMIN_PASSWORD) {
+      window.localStorage.setItem(ADMIN_UNLOCK_KEY, "true");
+      setUnlocked(true);
+      setPasswordError(false);
+    } else {
+      setPasswordError(true);
+    }
   };
 
   const formattedDate = (() => {
@@ -369,6 +520,53 @@ export default function App() {
       data.gallery.length ? (i - 1 + data.gallery.length) % data.gallery.length : 0
     );
 
+  /* ================================================================ */
+  /*  GERBANG PASSWORD: hanya pemilik app yang bisa masuk dashboard    */
+  /* ================================================================ */
+  if (!unlocked) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center px-6">
+        <form
+          onSubmit={handlePasswordSubmit}
+          className="w-full max-w-xs bg-slate-900/70 border border-slate-800 rounded-2xl p-6 text-center"
+        >
+          <div className="w-12 h-12 mx-auto rounded-xl bg-gradient-to-br from-fuchsia-500 via-purple-600 to-indigo-700 flex items-center justify-center mb-4">
+            <Lock size={20} className="text-white" />
+          </div>
+          <h1 className="text-white font-bold text-lg mb-1">Dashboard Admin</h1>
+          <p className="text-slate-500 text-xs mb-5">
+            Halaman ini khusus pemilik aplikasi. Masukkan kata sandi untuk melanjutkan.
+          </p>
+          <input
+            type="password"
+            autoFocus
+            value={passwordInput}
+            onChange={(e) => {
+              setPasswordInput(e.target.value);
+              setPasswordError(false);
+            }}
+            placeholder="Kata sandi"
+            className={`w-full bg-slate-950 border rounded-lg px-3 py-2.5 text-sm text-slate-100 placeholder-slate-600 outline-none mb-2 ${
+              passwordError ? "border-red-500" : "border-slate-700 focus:border-fuchsia-500/60"
+            }`}
+          />
+          {passwordError && (
+            <p className="text-red-400 text-[11px] mb-3">Kata sandi salah, coba lagi.</p>
+          )}
+          <button
+            type="submit"
+            className="w-full bg-fuchsia-600 hover:bg-fuchsia-500 text-white text-sm font-semibold py-2.5 rounded-lg transition-colors mt-2"
+          >
+            Masuk
+          </button>
+        </form>
+      </div>
+    );
+  }
+
+  /* ================================================================ */
+  /*  DASHBOARD ADMIN: editor split-screen                             */
+  /* ================================================================ */
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
       {/* =============== HEADER =============== */}
@@ -389,6 +587,30 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2">
+            {isSupabaseConfigured ? (
+              <div className="hidden sm:flex items-center gap-1.5 text-[11px] text-slate-500">
+                {saveStatus === "saving" && (
+                  <>
+                    <Loader2 size={12} className="animate-spin" /> Menyimpan...
+                  </>
+                )}
+                {saveStatus === "saved" && (
+                  <>
+                    <CheckCircle2 size={12} className="text-emerald-400" /> Tersimpan
+                  </>
+                )}
+                {saveStatus === "error" && (
+                  <>
+                    <AlertCircle size={12} className="text-red-400" /> Gagal simpan
+                  </>
+                )}
+              </div>
+            ) : (
+              <div className="hidden sm:flex items-center gap-1.5 text-[11px] text-amber-400">
+                <AlertCircle size={12} /> Server belum terhubung
+              </div>
+            )}
+
             <div className="hidden sm:flex items-center bg-slate-900 border border-slate-800 rounded-full p-1">
               <button
                 onClick={() => setViewMode("hp")}
@@ -417,7 +639,7 @@ export default function App() {
               className="relative flex items-center gap-1.5 bg-white text-slate-900 hover:bg-slate-200 transition-colors px-3.5 py-2 rounded-full text-xs font-semibold shadow"
             >
               {copied ? <Sparkles size={13} /> : <Copy size={13} />}
-              {copied ? "Tersalin!" : "Bagikan Link"}
+              {copied ? "Tersalin!" : "Link Tuan Rumah"}
             </button>
           </div>
         </div>
@@ -468,6 +690,34 @@ export default function App() {
                       className="w-full bg-transparent px-1 py-2.5 text-sm text-slate-100 placeholder-slate-600 outline-none"
                     />
                   </div>
+                </div>
+
+                <div className={`rounded-xl border ${isSupabaseConfigured ? "border-fuchsia-500/30 bg-fuchsia-500/5" : "border-amber-500/30 bg-amber-500/5"} p-4 mb-6`}>
+                  <p className={`text-[11px] font-bold uppercase tracking-wider mb-1.5 ${isSupabaseConfigured ? "text-fuchsia-400" : "text-amber-400"}`}>
+                    Link untuk Tuan Rumah
+                  </p>
+                  <p className="text-[11px] text-slate-400 mb-2 leading-relaxed">
+                    Kirim link ini ke tuan rumah acara. Mereka hanya bisa mengetik nama tamu
+                    untuk membuat link personal, tanpa bisa mengubah isi undangan.
+                  </p>
+                  <div className="flex items-center gap-2 bg-slate-950/60 rounded-lg px-3 py-2 mb-2">
+                    <code className="text-[11px] text-slate-300 truncate flex-1">
+                      {typeof window !== "undefined" ? window.location.origin : ""}/tuan-rumah/
+                      {data.slug || "..."}
+                    </code>
+                    <button
+                      onClick={copyLink}
+                      className="shrink-0 text-fuchsia-400 hover:text-fuchsia-300"
+                    >
+                      <Copy size={14} />
+                    </button>
+                  </div>
+                  {!isSupabaseConfigured && (
+                    <p className="text-[10px] text-amber-400/80">
+                      ⚠️ Server belum terhubung — link ini belum bisa dibuka tuan rumah/tamu
+                      sampai Environment Variable Supabase dipasang di Vercel.
+                    </p>
+                  )}
                 </div>
 
                 <TextInput
@@ -1107,6 +1357,335 @@ function PersonCard({ person, theme }) {
       <p className={`text-[11px] ${theme.subtext}`}>
         Putra/Putri dari {person.father} & {person.mother}
       </p>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  HALAMAN TAMU: "/<slug>?to=<nama>"                                  */
+/*  Read-only. Mengambil data dari server berdasarkan slug, lalu       */
+/*  menampilkan undangan penuh layar dengan nama tamu dari query.      */
+/* ------------------------------------------------------------------ */
+function GuestPage({ slug, guestNameOverride }) {
+  const [status, setStatus] = useState("loading"); // loading | ready | not-found | error
+  const [data, setData] = useState(null);
+  const [invitationState, setInvitationState] = useState("cover");
+  const [musicPlaying, setMusicPlaying] = useState(false);
+  const [galleryIndex, setGalleryIndex] = useState(0);
+  const audioRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      if (!isSupabaseConfigured) {
+        setStatus("error");
+        return;
+      }
+      const result = await fetchInvitation(slug);
+      if (cancelled) return;
+      if (result.error === "not-found") {
+        setStatus("not-found");
+      } else if (result.error) {
+        setStatus("error");
+      } else {
+        setData(result.data);
+        setStatus("ready");
+      }
+    }
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [slug]);
+
+  /* ---- Inject Google Fonts (tamu juga butuh font yang sama) ---- */
+  useEffect(() => {
+    const linkId = "undangkita-google-fonts";
+    let link = document.getElementById(linkId);
+    if (!link) {
+      link = document.createElement("link");
+      link.id = linkId;
+      link.rel = "stylesheet";
+      document.head.appendChild(link);
+    }
+    const families = Object.values(FONTS)
+      .map((f) => `family=${f.googleName}`)
+      .join("&");
+    link.href = `https://fonts.googleapis.com/css2?${families}&display=swap`;
+  }, []);
+
+  if (status === "loading") {
+    return (
+      <div className="min-h-screen w-full flex flex-col items-center justify-center bg-slate-950 text-slate-400 gap-3">
+        <Loader2 size={28} className="animate-spin text-fuchsia-400" />
+        <p className="text-sm">Memuat undangan...</p>
+      </div>
+    );
+  }
+
+  if (status === "not-found") {
+    return (
+      <div className="min-h-screen w-full flex flex-col items-center justify-center bg-slate-950 text-center px-6 gap-2">
+        <AlertCircle size={28} className="text-amber-400 mb-2" />
+        <p className="text-white font-semibold">Undangan tidak ditemukan</p>
+        <p className="text-slate-500 text-xs max-w-xs">
+          Link ini mungkin salah ketik, atau undangannya belum dipublikasikan oleh pemilik acara.
+        </p>
+      </div>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <div className="min-h-screen w-full flex flex-col items-center justify-center bg-slate-950 text-center px-6 gap-2">
+        <AlertCircle size={28} className="text-red-400 mb-2" />
+        <p className="text-white font-semibold">Undangan belum bisa dimuat</p>
+        <p className="text-slate-500 text-xs max-w-xs">
+          Server sedang bermasalah atau belum terhubung. Coba muat ulang halaman beberapa saat lagi.
+        </p>
+      </div>
+    );
+  }
+
+  const theme = THEMES[data.theme] || THEMES.royalGold;
+  const font = FONTS[data.font] || FONTS.serif;
+  const displayData = guestNameOverride ? { ...data, guestName: guestNameOverride } : data;
+
+  const formattedDate = (() => {
+    try {
+      return new Date(data.eventDate).toLocaleDateString("id-ID", {
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+      });
+    } catch {
+      return data.eventDate;
+    }
+  })();
+
+  const handleOpenInvitation = () => {
+    setInvitationState("content");
+    setTimeout(() => {
+      if (audioRef.current) {
+        audioRef.current.play().catch(() => {});
+        setMusicPlaying(true);
+      }
+    }, 150);
+  };
+
+  const handleBackToCover = () => {
+    setInvitationState("cover");
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+    }
+    setMusicPlaying(false);
+    setGalleryIndex(0);
+  };
+
+  const toggleMusic = () => {
+    if (!audioRef.current) return;
+    if (musicPlaying) {
+      audioRef.current.pause();
+    } else {
+      audioRef.current.play().catch(() => {});
+    }
+    setMusicPlaying(!musicPlaying);
+  };
+
+  const gallery = data.gallery || [];
+  const nextSlide = () => setGalleryIndex((i) => (gallery.length ? (i + 1) % gallery.length : 0));
+  const prevSlide = () =>
+    setGalleryIndex((i) => (gallery.length ? (i - 1 + gallery.length) % gallery.length : 0));
+
+  return (
+    <div className="min-h-screen w-full flex items-center justify-center bg-black">
+      <div className="w-full h-screen sm:max-w-[480px] sm:h-[92vh] sm:my-4 sm:rounded-[2rem] sm:overflow-hidden sm:shadow-2xl overflow-y-auto scrollbar-hide">
+        <InvitationPreview
+          data={displayData}
+          theme={theme}
+          font={font}
+          invitationState={invitationState}
+          onOpen={handleOpenInvitation}
+          onBack={handleBackToCover}
+          musicPlaying={musicPlaying}
+          toggleMusic={toggleMusic}
+          galleryIndex={galleryIndex}
+          nextSlide={nextSlide}
+          prevSlide={prevSlide}
+          formattedDate={formattedDate}
+          audioRef={audioRef}
+        />
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  HALAMAN TUAN RUMAH: "/tuan-rumah/<slug>"                           */
+/*  Hanya bisa mengetik nama tamu dan membuat link personal untuk      */
+/*  dibagikan. Tidak bisa mengubah isi undangan sama sekali.           */
+/* ------------------------------------------------------------------ */
+function HostLinkPage({ slug }) {
+  const [status, setStatus] = useState("loading"); // loading | ready | not-found | error
+  const [eventData, setEventData] = useState(null);
+  const [guestNameInput, setGuestNameInput] = useState("");
+  const [generatedLink, setGeneratedLink] = useState("");
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      if (!isSupabaseConfigured) {
+        setStatus("error");
+        return;
+      }
+      const result = await fetchInvitation(slug);
+      if (cancelled) return;
+      if (result.error === "not-found") {
+        setStatus("not-found");
+      } else if (result.error) {
+        setStatus("error");
+      } else {
+        setEventData(result.data);
+        setStatus("ready");
+      }
+    }
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [slug]);
+
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+
+  const handleGenerate = () => {
+    const name = guestNameInput.trim();
+    if (!name) return;
+    const url = `${origin}/${slug}?to=${encodeURIComponent(name)}`;
+    setGeneratedLink(url);
+    setCopied(false);
+  };
+
+  const handleCopy = () => {
+    if (navigator.clipboard && generatedLink) {
+      navigator.clipboard.writeText(generatedLink).catch(() => {});
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const waShareUrl = generatedLink
+    ? `https://wa.me/?text=${encodeURIComponent(
+        `Assalamu'alaikum/Halo, dengan hormat kami mengundang Anda untuk hadir di acara kami. Silakan buka undangan digital berikut:\n${generatedLink}`
+      )}`
+    : "";
+
+  if (status === "loading") {
+    return (
+      <div className="min-h-screen w-full flex flex-col items-center justify-center bg-slate-950 text-slate-400 gap-3">
+        <Loader2 size={28} className="animate-spin text-fuchsia-400" />
+        <p className="text-sm">Memuat data acara...</p>
+      </div>
+    );
+  }
+
+  if (status === "not-found") {
+    return (
+      <div className="min-h-screen w-full flex flex-col items-center justify-center bg-slate-950 text-center px-6 gap-2">
+        <AlertCircle size={28} className="text-amber-400 mb-2" />
+        <p className="text-white font-semibold">Acara tidak ditemukan</p>
+        <p className="text-slate-500 text-xs max-w-xs">
+          Link ini mungkin salah ketik, atau pemilik acara belum menyimpan undangannya ke server.
+        </p>
+      </div>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <div className="min-h-screen w-full flex flex-col items-center justify-center bg-slate-950 text-center px-6 gap-2">
+        <AlertCircle size={28} className="text-red-400 mb-2" />
+        <p className="text-white font-semibold">Halaman belum bisa dimuat</p>
+        <p className="text-slate-500 text-xs max-w-xs">
+          Server sedang bermasalah atau belum terhubung. Coba muat ulang halaman beberapa saat lagi.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen w-full bg-slate-950 text-slate-100 flex flex-col items-center px-5 py-10">
+      <div className="w-full max-w-sm">
+        <div className="flex items-center gap-2.5 mb-8 justify-center">
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-fuchsia-500 via-purple-600 to-indigo-700 flex items-center justify-center shadow-lg shadow-fuchsia-900/40">
+            <Users size={18} className="text-white" />
+          </div>
+          <div className="leading-tight">
+            <h1 className="text-base font-bold text-white">Buat Link Tamu</h1>
+            <p className="text-[11px] text-slate-500">
+              {eventData?.groom?.nickname} & {eventData?.bride?.nickname}
+            </p>
+          </div>
+        </div>
+
+        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5">
+          <p className="text-xs text-slate-400 mb-4 leading-relaxed">
+            Ketik nama tamu yang ingin diundang, lalu buat link khusus untuk mereka. Setiap
+            tamu bisa punya link dengan nama masing-masing.
+          </p>
+
+          <FieldLabel icon={User}>Nama Tamu</FieldLabel>
+          <input
+            value={guestNameInput}
+            onChange={(e) => setGuestNameInput(e.target.value)}
+            placeholder="Bapak/Ibu Joko Widodo"
+            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-slate-100 placeholder-slate-600 outline-none focus:border-fuchsia-500/60 focus:ring-1 focus:ring-fuchsia-500/40 transition-all mb-3"
+            onKeyDown={(e) => e.key === "Enter" && handleGenerate()}
+          />
+
+          <button
+            onClick={handleGenerate}
+            disabled={!guestNameInput.trim()}
+            className="w-full flex items-center justify-center gap-2 bg-fuchsia-600 hover:bg-fuchsia-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold py-2.5 rounded-lg transition-colors"
+          >
+            <Sparkles size={14} /> Buat Link
+          </button>
+
+          {generatedLink && (
+            <div className="mt-5 pt-5 border-t border-slate-800">
+              <p className="text-[11px] uppercase tracking-wider text-slate-500 mb-2">
+                Link untuk {guestNameInput}
+              </p>
+              <div className="flex items-center gap-2 bg-slate-950 rounded-lg px-3 py-2 mb-3">
+                <code className="text-[11px] text-slate-300 truncate flex-1">{generatedLink}</code>
+                <button onClick={handleCopy} className="shrink-0 text-fuchsia-400 hover:text-fuchsia-300">
+                  <Copy size={14} />
+                </button>
+              </div>
+              {copied && (
+                <p className="text-[11px] text-emerald-400 mb-3 flex items-center gap-1">
+                  <CheckCircle2 size={12} /> Link tersalin ke clipboard
+                </p>
+              )}
+              <a
+                href={waShareUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold py-2.5 rounded-lg transition-colors"
+              >
+                <Share2 size={14} /> Bagikan via WhatsApp
+              </a>
+            </div>
+          )}
+        </div>
+
+        <p className="text-center text-[10px] text-slate-600 mt-6">
+          Halaman ini tidak bisa mengubah isi undangan. Untuk mengubah tema, foto, atau
+          detail acara, hubungi penyedia undangan.
+        </p>
+      </div>
     </div>
   );
 }
